@@ -57,19 +57,54 @@ class _GenerationCheck(NamedTuple):
 
 
 _MARKER_BYTES = 128
+_DIGEST_CHUNK_BYTES = 64 * 1024
+
+
+class _Prefix(NamedTuple):
+    """Digest of a transcript's first ``size`` bytes.
+
+    ``state`` is the hash object that produced ``digest``, positioned exactly
+    at ``size``; it is only ever copied, so a later append can be hashed on top
+    of it without reading the bytes before ``size`` again.
+    """
+
+    size: int
+    digest: bytes
+    state: Any
+
+
+def _hash_into(state: Any, transcript: Any, remaining: int) -> int:
+    """Feed up to *remaining* bytes into *state*; return how many were read."""
+    hashed = 0
+    while remaining:
+        chunk = transcript.read(min(_DIGEST_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        state.update(chunk)
+        hashed += len(chunk)
+        remaining -= len(chunk)
+    return hashed
+
+
+def _read_prefix(file_path: Path, size: int) -> _Prefix:
+    """Hash the first *size* bytes of *file_path* (fewer if it is shorter)."""
+    state = hashlib.sha256()
+    with file_path.open("rb") as transcript:
+        hashed = _hash_into(state, transcript, size)
+    return _Prefix(hashed, state.digest(), state)
+
+
+def _extend_prefix(prefix: _Prefix, file_path: Path, size: int) -> _Prefix:
+    """The prefix digest at *size*, reading only the bytes past ``prefix.size``."""
+    state = prefix.state.copy()
+    with file_path.open("rb") as transcript:
+        transcript.seek(prefix.size)
+        hashed = _hash_into(state, transcript, size - prefix.size)
+    return _Prefix(prefix.size + hashed, state.digest(), state)
 
 
 def _prefix_digest(file_path: Path, size: int) -> bytes:
-    digest = hashlib.sha256()
-    with file_path.open("rb") as transcript:
-        remaining = size
-        while remaining:
-            chunk = transcript.read(min(64 * 1024, remaining))
-            if not chunk:
-                break
-            digest.update(chunk)
-            remaining -= len(chunk)
-    return digest.digest()
+    return _read_prefix(file_path, size).digest
 
 
 def _tail_marker(file_path: Path, offset: int) -> bytes:
@@ -168,15 +203,12 @@ class TranscriptReader:
                 continue
         return sizes
 
-    def _snapshot_file_prefixes(self) -> dict[str, tuple[int, bytes]]:
-        prefixes: dict[str, tuple[int, bytes]] = {}
+    def _snapshot_file_prefixes(self) -> dict[str, _Prefix]:
+        prefixes: dict[str, _Prefix] = {}
         for session_id, tracked in self._state.tracked_sessions.items():
             try:
                 size = Path(tracked.file_path).stat().st_size
-                prefixes[session_id] = (
-                    size,
-                    _prefix_digest(Path(tracked.file_path), size),
-                )
+                prefixes[session_id] = _read_prefix(Path(tracked.file_path), size)
             except OSError:
                 continue
         return prefixes
@@ -248,7 +280,7 @@ class TranscriptReader:
         return (
             consumed > 0
             and saved is not None
-            and saved[0] >= consumed
+            and saved.size >= consumed
             and st.st_size >= consumed
         )
 
@@ -263,12 +295,12 @@ class TranscriptReader:
         """
         if not self._prefix_covers_consumed(session_id, consumed, st):
             return False
-        size, digest = self._file_prefixes[session_id]
+        saved = self._file_prefixes[session_id]
         try:
-            current = await asyncio.to_thread(_prefix_digest, file_path, size)
+            current = await asyncio.to_thread(_prefix_digest, file_path, saved.size)
         except OSError:
             return False
-        return current == digest
+        return current == saved.digest
 
     async def _marker_changed(
         self, session_id: str, tracked: TrackedSession, file_path: Path
@@ -297,35 +329,39 @@ class TranscriptReader:
         previous_ctime = self._file_ctimes.get(session_id)
         changed = previous is not None and previous != generation
         previous_size = self._file_sizes.get(session_id)
-        previous_prefix = self._file_prefixes.get(session_id)
-        prefix_changed = False
-        prefix_verified = False
-        if previous_prefix is not None:
-            try:
-                prefix_changed = (
-                    await asyncio.to_thread(
-                        _prefix_digest, file_path, previous_prefix[0]
-                    )
-                    != previous_prefix[1]
-                )
-            except OSError:
-                prefix_changed = False
-            else:
-                prefix_verified = True
-        changed = (
-            changed
-            or prefix_changed
-            or (
-                previous_ctime is not None
-                and previous_ctime != st.st_ctime_ns
-                and previous_size is not None
-                and st.st_size <= previous_size
-            )
+        changed = changed or (
+            previous_ctime is not None
+            and previous_ctime != st.st_ctime_ns
+            and previous_size is not None
+            and st.st_size <= previous_size
         )
         pos = self._parse_pos(tracked)
         changed = changed or st.st_size < pos
         if not changed and check_marker:
             changed = await self._marker_changed(session_id, tracked, file_path)
+        # Hashing the delivered prefix means reading the whole file, and a
+        # long session's transcript runs to hundreds of MB; doing that on
+        # every poll kept a core busy. An append-only transcript that shows
+        # none of the signals above has only grown, so its prefix is read
+        # only once a signal fires, which is when the answer decides between
+        # a false positive and a replacement. A whole-file transcript has no
+        # marker to watch, so its prefix stays the per-poll content check.
+        prefix_changed = False
+        prefix_verified = False
+        previous_prefix = self._file_prefixes.get(session_id)
+        if previous_prefix is not None and (changed or not check_marker):
+            try:
+                prefix_changed = (
+                    await asyncio.to_thread(
+                        _prefix_digest, file_path, previous_prefix.size
+                    )
+                    != previous_prefix.digest
+                )
+            except OSError:
+                prefix_changed = False
+            else:
+                prefix_verified = True
+        changed = changed or prefix_changed
         consumed_intact = False
         if changed:
             consumed_intact = (
@@ -402,8 +438,15 @@ class TranscriptReader:
         tracked: TrackedSession,
         file_path: Path,
         stable_read: _StableRead,
+        *,
+        extend_prefix: bool = False,
     ) -> bool:
-        """Commit caches only after a stable read and marker capture."""
+        """Commit caches only after a stable read and marker capture.
+
+        With *extend_prefix* the caller vouches that the cached prefix still
+        describes this file's first bytes (nothing in this poll pointed at a
+        replacement), so the new digest hashes only the bytes appended since.
+        """
         stable_stat = stable_read.stat
         try:
             marker = await asyncio.to_thread(
@@ -411,6 +454,17 @@ class TranscriptReader:
             )
         except OSError:
             return False
+        previous_prefix = self._file_prefixes.get(session_id)
+        extend_from = (
+            previous_prefix
+            if extend_prefix
+            and not stable_read.reset_generation
+            and previous_prefix is not None
+            and previous_prefix.size <= stable_stat.st_size
+            and self._file_generations.get(session_id)
+            == (stable_stat.st_dev, stable_stat.st_ino)
+            else None
+        )
         self._file_mtimes[session_id] = stable_stat.st_mtime
         self._file_generations[session_id] = (
             stable_stat.st_dev,
@@ -419,8 +473,11 @@ class TranscriptReader:
         self._file_ctimes[session_id] = stable_stat.st_ctime_ns
         self._file_sizes[session_id] = stable_stat.st_size
         self._file_prefixes[session_id] = (
-            stable_stat.st_size,
-            await asyncio.to_thread(_prefix_digest, file_path, stable_stat.st_size),
+            await asyncio.to_thread(
+                _extend_prefix, extend_from, file_path, stable_stat.st_size
+            )
+            if extend_from is not None
+            else await asyncio.to_thread(_read_prefix, file_path, stable_stat.st_size)
         )
         self._file_markers[session_id] = (self._parse_pos(tracked), marker)
         return True
@@ -541,9 +598,8 @@ class TranscriptReader:
         self._file_generations[session_id] = (st.st_dev, st.st_ino)
         self._file_ctimes[session_id] = st.st_ctime_ns
         self._file_sizes[session_id] = st.st_size
-        self._file_prefixes[session_id] = (
-            st.st_size,
-            await asyncio.to_thread(_prefix_digest, file_path, st.st_size),
+        self._file_prefixes[session_id] = await asyncio.to_thread(
+            _read_prefix, file_path, st.st_size
         )
         try:
             marker = await asyncio.to_thread(_tail_marker, file_path, st.st_size)
@@ -610,9 +666,8 @@ class TranscriptReader:
                 self._file_generations[session_id] = generation
                 self._file_ctimes[session_id] = st.st_ctime_ns
                 self._file_sizes[session_id] = st.st_size
-                self._file_prefixes[session_id] = (
-                    st.st_size,
-                    await asyncio.to_thread(_prefix_digest, file_path, st.st_size),
+                self._file_prefixes[session_id] = await asyncio.to_thread(
+                    _read_prefix, file_path, st.st_size
                 )
             try:
                 marker = await asyncio.to_thread(
@@ -675,7 +730,11 @@ class TranscriptReader:
             return
         new_entries, _, reset_during_read = stable_read
         if not await self._commit_stable_read(
-            session_id, tracked, file_path, stable_read
+            session_id,
+            tracked,
+            file_path,
+            stable_read,
+            extend_prefix=not generation_changed,
         ):
             return
         if reset_during_read:

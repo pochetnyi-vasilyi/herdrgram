@@ -1,9 +1,11 @@
 """Tests for transcript reader offset handling."""
 
+import hashlib
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from ccgram import transcript_reader
 from ccgram.idle_tracker import IdleTracker
 from ccgram.monitor_state import BacklogSkipIntent, MonitorState, TrackedSession
 from ccgram.transcript_reader import TranscriptReader, _StableRead
@@ -488,3 +490,114 @@ async def test_replaced_smaller_transcript_resumes_from_eof_no_replay(
     tracked = state.get_session("sess-replaced")
     assert tracked is not None
     assert tracked.parsed_offset == session_file.stat().st_size
+
+
+def _delivered_transcript(tmp_path):
+    """A five-entry transcript whose every byte is already delivered."""
+    history = "".join(
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"h%d"}]}}\n'
+        % index
+        for index in range(5)
+    )
+    session_file = tmp_path / "transcript.jsonl"
+    session_file.write_text(history, newline="\n")
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    state.update_session(
+        TrackedSession(
+            session_id="sess",
+            file_path=str(session_file),
+            last_byte_offset=session_file.stat().st_size,
+        )
+    )
+    return session_file, TranscriptReader(state, IdleTracker())
+
+
+class _CountingSha256:
+    """sha256 that records every byte it is fed; copies share the record."""
+
+    def __init__(self, fed: list[int], inner=None) -> None:
+        self._fed = fed
+        self._inner = inner if inner is not None else hashlib.sha256()
+
+    def update(self, data) -> None:
+        self._fed.append(len(data))
+        self._inner.update(data)
+
+    def digest(self) -> bytes:
+        return self._inner.digest()
+
+    def copy(self) -> "_CountingSha256":
+        return _CountingSha256(self._fed, self._inner.copy())
+
+
+def _count_hashed_bytes():
+    """Make the reader's sha256 count the bytes it hashes."""
+    fed: list[int] = []
+    counting = SimpleNamespace(sha256=lambda: _CountingSha256(fed))
+    return fed, patch.object(transcript_reader, "hashlib", counting)
+
+
+async def test_idle_transcript_is_not_rehashed_on_every_poll(tmp_path) -> None:
+    fed, counting = _count_hashed_bytes()
+    with counting:
+        session_file, reader = _delivered_transcript(tmp_path)
+        fed.clear()
+        for _ in range(3):
+            await reader._process_session_file("sess", session_file, [], window_id="@1")
+
+    assert sum(fed) == 0
+
+
+async def test_appended_transcript_hashes_only_the_new_bytes(tmp_path) -> None:
+    fresh = (
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"fresh"}]}}\n'
+    )
+    fed, counting = _count_hashed_bytes()
+    messages = []
+    with counting:
+        session_file, reader = _delivered_transcript(tmp_path)
+        with session_file.open("a", newline="\n") as transcript:
+            transcript.write(fresh)
+        fed.clear()
+        await reader._process_session_file(
+            "sess", session_file, messages, window_id="@1"
+        )
+
+    assert [msg.text for msg in messages] == ["fresh"]
+    assert sum(fed) == len(fresh.encode())
+    saved = reader._file_prefixes["sess"]
+    assert saved.size == session_file.stat().st_size
+    assert saved.digest == hashlib.sha256(session_file.read_bytes()).digest()
+
+
+async def test_replacement_signal_still_checks_the_whole_delivered_prefix(
+    tmp_path,
+) -> None:
+    fed, counting = _count_hashed_bytes()
+    messages = []
+    with counting:
+        session_file, reader = _delivered_transcript(tmp_path)
+        # A metadata-only change (chmod) moves ctime, but within the same
+        # clock tick it may not; shift the recorded ctime so the signal fires.
+        reader._file_ctimes["sess"] -= 1
+        fed.clear()
+        await reader._process_session_file(
+            "sess", session_file, messages, window_id="@1"
+        )
+
+    assert messages == []
+    assert sum(fed) == session_file.stat().st_size
+
+
+async def test_in_place_rewrite_rehashes_the_new_content(tmp_path) -> None:
+    session_file, reader = _delivered_transcript(tmp_path)
+    await reader._process_session_file("sess", session_file, [], window_id="@1")
+    rewritten = session_file.read_text().replace('"h0"', '"x0"', 1)
+    session_file.write_text(rewritten, newline="\n")
+
+    messages = []
+    await reader._process_session_file("sess", session_file, messages, window_id="@1")
+
+    assert messages == []
+    saved = reader._file_prefixes["sess"]
+    assert saved.digest == hashlib.sha256(session_file.read_bytes()).digest()
