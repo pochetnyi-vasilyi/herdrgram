@@ -519,6 +519,12 @@ class TopicLifecycleStrategy:
         if existing is None or existing[0] != state:
             ts.autoclose = (state, now)
 
+    def restart_autoclose_timer(
+        self, user_id: int, thread_id: int, state: str, now: float
+    ) -> None:
+        """Run the timer again from *now*: the next expiry is a full period away."""
+        self.get_state(user_id, thread_id).autoclose = (state, now)
+
     def clear_autoclose_timer(self, user_id: int, thread_id: int) -> None:
         """Clear autoclose timer for a topic (on cleanup or when active)."""
         ts = self._states.get((user_id, thread_id))

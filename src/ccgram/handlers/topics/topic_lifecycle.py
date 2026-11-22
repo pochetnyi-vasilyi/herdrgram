@@ -61,6 +61,25 @@ def rollback_legacy_herdr_binding(user_id: int, thread_id: int, window_id: str) 
 # ── Autoclose timer management ────────────────────────────────────────────
 
 
+# How often the same topic's failed retirement is reported at warning level.
+_AUTOCLOSE_FAILURE_LOG_COOLDOWN = 3600.0
+_autoclose_failure_logged: dict[tuple[int, int], float] = {}
+
+
+def _defer_autoclose(user_id: int, thread_id: int, state: str) -> None:
+    """Start the topic's timer over: the next attempt is a full period away.
+
+    An expired timer stays expired, so whatever leaves it in place is tried
+    again on every poll tick — the window listing read first, then the call
+    to Telegram. A refusal (no right to manage topics, a chat whose topics
+    have no closed state) is answered the same way each time, and an outage
+    does not end sooner for being asked every second.
+    """
+    lifecycle_strategy.restart_autoclose_timer(
+        user_id, thread_id, state, time.monotonic()
+    )
+
+
 async def check_autoclose_timers(client: TelegramClient) -> None:
     """Close topics whose done/dead timers have expired."""
     all_topics = lifecycle_strategy.iter_topic_states()
@@ -112,6 +131,7 @@ async def _close_expired_topic(
 
         present = await window_presence(window_id, tmux_manager)
         if present is None:
+            _defer_autoclose(user_id, thread_id, state)
             logger.warning(
                 "stale_dead_autoclose_deferred",
                 thread_id=thread_id,
@@ -138,8 +158,28 @@ async def _close_expired_topic(
         if is_thread_gone(e):
             removed = True
         else:
-            logger.debug("autoclose_failed", thread_id=thread_id, error=str(e))
+            _defer_autoclose(user_id, thread_id, state)
+            # Visible, with Telegram's own words, but not once per period for
+            # a topic that will be refused for as long as it exists.
+            now = time.monotonic()
+            key = (user_id, thread_id)
+            last = _autoclose_failure_logged.get(key)
+            report = (
+                logger.debug
+                if last is not None and now - last < _AUTOCLOSE_FAILURE_LOG_COOLDOWN
+                else logger.warning
+            )
+            if report == logger.warning:
+                _autoclose_failure_logged[key] = now
+            report(
+                "autoclose_failed",
+                chat_id=chat_id,
+                thread_id=thread_id,
+                state=state,
+                error=str(e),
+            )
     if removed:
+        _autoclose_failure_logged.pop((user_id, thread_id), None)
         lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
         logger.info(
             "auto_closed_topic", chat_id=chat_id, thread_id=thread_id, user_id=user_id

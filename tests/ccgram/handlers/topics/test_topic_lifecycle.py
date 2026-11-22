@@ -9,6 +9,7 @@ from telegram.error import BadRequest, RetryAfter, TelegramError
 from ccgram.multiplexer.base import WindowRef
 from ccgram.window_view import WindowView
 
+from ccgram.handlers.topics import topic_lifecycle as tl
 from ccgram.handlers.topics.topic_lifecycle import (
     PROBE_MAX_PER_CYCLE,
     check_autoclose_timers,
@@ -27,6 +28,7 @@ from ccgram.telegram_rate_limiter import NO_RETRY_RATE_LIMIT_ARGS
 
 @pytest.fixture(autouse=True)
 def _clean_strategy_state():
+    tl._autoclose_failure_logged.clear()
     reset_probe_schedule()
     terminal_poll_state._states.clear()
     lifecycle_strategy._states.clear()
@@ -125,6 +127,122 @@ class TestCheckAutocloseTimers:
             )
             await check_autoclose_timers(bot)
         bot.delete_forum_topic.assert_not_called()
+        assert lifecycle_strategy.get_state(user_id, thread_id).autoclose is None
+
+    async def test_refused_close_waits_a_full_period_before_the_next_try(self):
+        """A refusal is the same on the next tick; asking every second helps nobody."""
+        bot = AsyncMock(spec=Bot)
+        bot.close_forum_topic.side_effect = BadRequest("Topic_not_modified")
+        user_id, thread_id = 1, 100
+        lifecycle_strategy.start_autoclose_timer(
+            user_id, thread_id, "done", time.monotonic() - 99999
+        )
+        with (
+            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.thread_router"
+            ) as mock_router,
+            patch("ccgram.handlers.topics.topic_lifecycle.logger") as mock_logger,
+        ):
+            mock_config.autoclose_done_minutes = 1
+            mock_config.delete_topic_on_autoclose = False
+            mock_router.resolve_chat_id.return_value = 42
+            mock_router.get_window_for_thread.return_value = "@0"
+            for _tick in range(5):
+                await check_autoclose_timers(bot)
+            assert bot.close_forum_topic.call_count == 1
+            # Said once, where it is seen, with what Telegram answered.
+            assert [c.args[0] for c in mock_logger.warning.call_args_list] == [
+                "autoclose_failed"
+            ]
+            assert "Topic_not_modified" in str(mock_logger.warning.call_args)
+
+            # The timer runs again from the failure: a full period later, one more try.
+            state, entered_at = lifecycle_strategy.get_state(
+                user_id, thread_id
+            ).autoclose
+            assert state == "done" and time.monotonic() - entered_at < 5
+            lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
+            lifecycle_strategy.start_autoclose_timer(
+                user_id, thread_id, "done", time.monotonic() - 99999
+            )
+            for _tick in range(3):
+                await check_autoclose_timers(bot)
+            assert bot.close_forum_topic.call_count == 2
+            # The same refusal again within the hour is not news.
+            assert mock_logger.warning.call_count == 1
+
+    async def test_a_dead_topic_is_not_asked_about_every_tick_while_refused(self):
+        """Each try reads the whole window listing first; that must not repeat either."""
+        bot = AsyncMock(spec=Bot)
+        bot.close_forum_topic.side_effect = BadRequest("Not enough rights")
+        user_id, thread_id = 1, 100
+        lifecycle_strategy.start_autoclose_timer(
+            user_id, thread_id, "dead", time.monotonic() - 99999
+        )
+        with (
+            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.thread_router"
+            ) as mock_router,
+            patch("ccgram.handlers.topics.topic_lifecycle.tmux_manager") as mock_tmux,
+        ):
+            mock_config.autoclose_dead_minutes = 10
+            mock_config.delete_topic_on_autoclose = False
+            mock_router.resolve_chat_id.return_value = 42
+            mock_router.iter_thread_bindings_with_chat.return_value = []
+            mock_router.get_window_for_thread.return_value = "@0"
+            mock_tmux.list_windows_for_reconciliation = AsyncMock(
+                return_value=[WindowRef(window_id="@1", window_name="p", cwd="/p")]
+            )
+            for _tick in range(5):
+                await check_autoclose_timers(bot)
+        assert bot.close_forum_topic.call_count == 1
+        assert mock_tmux.list_windows_for_reconciliation.await_count == 1
+
+    async def test_unknown_backend_defers_a_dead_topic_a_full_period(self):
+        bot = AsyncMock(spec=Bot)
+        user_id, thread_id = 1, 100
+        lifecycle_strategy.start_autoclose_timer(
+            user_id, thread_id, "dead", time.monotonic() - 99999
+        )
+        with (
+            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.thread_router"
+            ) as mock_router,
+            patch("ccgram.handlers.topics.topic_lifecycle.tmux_manager") as mock_tmux,
+        ):
+            mock_config.autoclose_dead_minutes = 10
+            mock_config.delete_topic_on_autoclose = False
+            mock_router.iter_thread_bindings_with_chat.return_value = []
+            mock_router.get_window_for_thread.return_value = "@0"
+            mock_tmux.list_windows_for_reconciliation = AsyncMock(return_value=None)
+            for _tick in range(5):
+                await check_autoclose_timers(bot)
+        assert mock_tmux.list_windows_for_reconciliation.await_count == 1
+        bot.close_forum_topic.assert_not_called()
+        state, entered_at = lifecycle_strategy.get_state(user_id, thread_id).autoclose
+        assert state == "dead" and time.monotonic() - entered_at < 5
+
+    async def test_a_topic_that_is_gone_is_simply_forgotten(self):
+        bot = AsyncMock(spec=Bot)
+        bot.close_forum_topic.side_effect = BadRequest("Message thread not found")
+        user_id, thread_id = 1, 100
+        lifecycle_strategy.start_autoclose_timer(
+            user_id, thread_id, "done", time.monotonic() - 99999
+        )
+        with (
+            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.thread_router"
+            ) as mock_router,
+        ):
+            mock_config.autoclose_done_minutes = 1
+            mock_config.delete_topic_on_autoclose = False
+            mock_router.resolve_chat_id.return_value = 42
+            mock_router.get_window_for_thread.return_value = "@0"
+            await check_autoclose_timers(bot)
         assert lifecycle_strategy.get_state(user_id, thread_id).autoclose is None
 
 
