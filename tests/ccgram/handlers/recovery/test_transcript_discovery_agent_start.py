@@ -12,7 +12,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -61,7 +61,7 @@ async def _register(path: Path, started_at: float | None) -> MagicMock:
     )
     sync = MagicMock()
     with (
-        patch(f"{MODULE}._agent_started_at", return_value=started_at),
+        patch(f"{MODULE}._agent_started_at", AsyncMock(return_value=started_at)),
         patch(f"{MODULE}._session_id_already_bound", return_value=False),
         patch(f"{MODULE}.session_map_sync", sync),
     ):
@@ -131,3 +131,27 @@ def test_transcript_start_reads_the_first_records_timestamp(tmp_path) -> None:
         1795000000.25, abs=0.01
     )
     assert discovery._transcript_started_at(str(tmp_path / "missing.jsonl")) is None
+
+
+async def test_agent_start_is_asked_from_the_backend_when_not_cached() -> None:
+    # A pane running ``codex`` names its provider by command, so the
+    # foreground process group is never cached; the backend still knows it.
+    backend = MagicMock()
+    backend.foreground = AsyncMock(return_value=MagicMock(pgid=os.getpid(), pid=0))
+    with (
+        patch(f"{MODULE}.get_cached_foreground_pgid", return_value=0),
+        patch(f"{MODULE}.tmux_manager", backend),
+        patch(f"{MODULE}._process_started_at", return_value=123.0) as started,
+    ):
+        assert await discovery._agent_started_at("w1") == 123.0
+    started.assert_called_once_with(os.getpid())
+
+
+async def test_agent_start_is_unknown_when_the_backend_cannot_answer() -> None:
+    backend = MagicMock()
+    backend.foreground = AsyncMock(side_effect=RuntimeError("not wired"))
+    with (
+        patch(f"{MODULE}.get_cached_foreground_pgid", return_value=0),
+        patch(f"{MODULE}.tmux_manager", backend),
+    ):
+        assert await discovery._agent_started_at("w1") is None

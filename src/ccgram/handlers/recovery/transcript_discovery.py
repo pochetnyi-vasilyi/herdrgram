@@ -64,9 +64,21 @@ def _process_started_at(pid: int) -> float | None:
         return None
 
 
-def _agent_started_at(window_id: str) -> float | None:
-    """Start time of the agent in the window's foreground, when it is known."""
+async def _agent_started_at(window_id: str) -> float | None:
+    """Start time of the agent in the window's foreground, when it is known.
+
+    The foreground process group is cached only when the pane's command did
+    not already name the provider; a pane running ``codex`` never fills that
+    cache, so ask the backend for its foreground process.
+    """
     pgid = get_cached_foreground_pgid(window_id)
+    if pgid <= 0:
+        try:
+            foreground = await tmux_manager.foreground(window_id)
+        except Exception:  # noqa: BLE001 — an unknown start keeps the old behaviour
+            foreground = None
+        if foreground is not None:
+            pgid = foreground.pgid or foreground.pid
     return _process_started_at(pgid) if pgid > 0 else None
 
 
@@ -370,8 +382,7 @@ async def _find_and_register_transcript(
     transcript_path_str = (
         str(identity.transcript_path) if identity.transcript_path else ""
     )
-    # Two short reads from /proc; not worth a worker thread.
-    started_at = _agent_started_at(window_id) if pane_alive else None
+    started_at = await _agent_started_at(window_id) if pane_alive else None
 
     for provider_name, provider in providers_to_try:
         max_age = 0 if pane_alive else None
