@@ -1223,6 +1223,25 @@ class TestWriteHooklessSessionMap:
         assert entry["provider_name"] == "codex"
         assert entry["window_name"] == "pumba-codex"
 
+    def test_codex_discovery_can_ask_to_read_from_the_start(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.tmux_session_name", "ccgram")
+
+        session_map_sync.write_hookless_session_map(
+            window_id="@7",
+            session_id="codex-uuid",
+            cwd="/my/project",
+            transcript_path="/path/rollout.jsonl",
+            provider_name="codex",
+            replay_from_start=True,
+        )
+
+        raw = json.loads(session_map_file.read_text())
+        assert raw["ccgram:@7"]["replay_from_start"] is True
+
     def test_pi_discovery_without_recovery_starts_at_tail(
         self, mgr: SessionManager, tmp_path, monkeypatch
     ) -> None:

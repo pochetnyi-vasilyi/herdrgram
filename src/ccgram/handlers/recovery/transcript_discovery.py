@@ -12,8 +12,10 @@ Key components:
 """
 
 import asyncio
+import json
 import os
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,6 +41,44 @@ if TYPE_CHECKING:
     from ...multiplexer.base import WindowRef as TmuxWindow
 
 logger = structlog.get_logger()
+
+# The agent's start time comes from the kernel and a transcript's times from
+# the agent's own clock and the file system; allow for them to differ a little.
+_AGENT_START_SLACK_SECONDS = 5.0
+
+
+def _process_started_at(pid: int) -> float | None:
+    """Wall-clock start time of a local process, or None where /proc is absent."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        boot = next(
+            int(line.split()[1])
+            for line in Path("/proc/stat").read_text().splitlines()
+            if line.startswith("btime ")
+        )
+        # Field 22 (starttime, clock ticks after boot); fields after the
+        # parenthesised command name start at field 3.
+        ticks = int(stat[stat.rindex(")") + 2 :].split()[19])
+        return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except OSError, ValueError, IndexError, StopIteration:
+        return None
+
+
+def _agent_started_at(window_id: str) -> float | None:
+    """Start time of the agent in the window's foreground, when it is known."""
+    pgid = get_cached_foreground_pgid(window_id)
+    return _process_started_at(pgid) if pgid > 0 else None
+
+
+def _transcript_started_at(path: str) -> float | None:
+    """Time of a transcript's first record, from its ``timestamp`` field."""
+    try:
+        with open(path, encoding="utf-8") as transcript:
+            first = transcript.readline(1 << 20)
+        stamp = json.loads(first).get("timestamp")
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except OSError, ValueError, AttributeError, TypeError:
+        return None
 
 
 def _session_id_already_bound(session_id: str, window_id: str) -> bool:
@@ -315,12 +355,23 @@ async def _find_and_register_transcript(
     providers_to_try: list[tuple[str, "AgentProvider"]],
     pane_alive: bool,
 ) -> None:
-    """Search for transcripts among candidate providers and register if found."""
+    """Search for transcripts among candidate providers and register if found.
+
+    A live pane lifts the age limit, so a session running for hours is still
+    found — but the newest transcript in the same directory can then be a
+    previous session's: Codex writes a new session's transcript only at its
+    first turn. A transcript last written before the agent in the pane started
+    cannot be its, so it is skipped until the agent's own appears. One that
+    began after the agent started is that agent's new session from its first
+    line, so it is read from the start instead of from its current end.
+    """
     window_key = f"{session_map_prefix()}{window_id}"
 
     transcript_path_str = (
         str(identity.transcript_path) if identity.transcript_path else ""
     )
+    # Two short reads from /proc; not worth a worker thread.
+    started_at = _agent_started_at(window_id) if pane_alive else None
 
     for provider_name, provider in providers_to_try:
         max_age = 0 if pane_alive else None
@@ -332,6 +383,28 @@ async def _find_and_register_transcript(
         )
         if not event:
             continue
+
+        replay_from_start = False
+        if started_at is not None:
+            try:
+                written = (
+                    await asyncio.to_thread(os.stat, event.transcript_path)
+                ).st_mtime
+            except OSError:
+                continue
+            if written < started_at - _AGENT_START_SLACK_SECONDS:
+                logger.debug(
+                    "Skipping a transcript last written before the agent started",
+                    window_id=window_id,
+                    session_id=event.session_id,
+                )
+                continue
+            began = await asyncio.to_thread(
+                _transcript_started_at, event.transcript_path
+            )
+            replay_from_start = (
+                began is not None and began >= started_at - _AGENT_START_SLACK_SECONDS
+            )
 
         if _session_id_already_bound(event.session_id, window_id):
             logger.debug(
@@ -362,6 +435,7 @@ async def _find_and_register_transcript(
             cwd=event.cwd,
             transcript_path=event.transcript_path,
             provider_name=provider_name,
+            replay_from_start=replay_from_start,
         )
         return
 

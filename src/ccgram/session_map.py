@@ -803,8 +803,13 @@ class SessionMapSync:
         cwd: str,
         transcript_path: str,
         provider_name: str,
+        replay_from_start: bool = False,
     ) -> None:
         """Write a synthetic entry to session_map.json for a hookless provider.
+
+        With *replay_from_start* the monitor reads the transcript from its
+        first line instead of its current end: the caller knows the whole file
+        is the new session's own (discovery found it only after its first turn).
 
         Uses file locking consistent with hook.py. Safe to call from any
         thread (no asyncio handles touched).
@@ -851,12 +856,15 @@ class SessionMapSync:
 
                     pending_key = pending_pi_replay_key(session_id)
                     existing = session_map.get(window_key)
-                    replay_from_start = provider_name == "pi" and (
-                        pending_key in session_map
-                        or (
-                            isinstance(existing, dict)
-                            and existing.get("session_id") == session_id
-                            and existing.get("replay_from_start") is True
+                    replay = replay_from_start or (
+                        provider_name == "pi"
+                        and (
+                            pending_key in session_map
+                            or (
+                                isinstance(existing, dict)
+                                and existing.get("session_id") == session_id
+                                and existing.get("replay_from_start") is True
+                            )
                         )
                     )
                     session_map[window_key] = serialize_session_map_entry(
@@ -865,7 +873,7 @@ class SessionMapSync:
                         display_name,
                         transcript_path,
                         provider_name,
-                        replay_from_start=replay_from_start,
+                        replay_from_start=replay,
                     )
                     session_map.pop(pending_key, None)
                     atomic_write_json(map_file, session_map)

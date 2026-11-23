@@ -1372,6 +1372,7 @@ class TestMaybeDiscoverTranscript:
             cwd="/my/project",
             transcript_path="/path/to/transcript.jsonl",
             provider_name="codex",
+            replay_from_start=False,
         )
 
     async def test_skips_session_if_already_bound_to_other_window(self) -> None:
