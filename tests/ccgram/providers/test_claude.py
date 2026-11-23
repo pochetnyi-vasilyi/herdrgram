@@ -10,7 +10,11 @@ from ccgram.providers.claude import (
     _find_mode_line,
     _mode_short_label,
 )
-from ccgram.providers._resume import discover_claude_sessions, index_message_count
+from ccgram.providers._resume import (
+    discover_claude_sessions,
+    index_message_count,
+    read_claude_session_title,
+)
 from ccgram.providers.codex import CodexProvider
 from ccgram.providers.gemini import GeminiProvider
 from ccgram.providers.shell import ShellProvider
@@ -454,3 +458,69 @@ class TestDiscoverClaudeSessions:
         (projects / "stray.jsonl").write_text(json.dumps({"cwd": str(tmp_path)}) + "\n")
 
         assert discover_claude_sessions(projects) == []
+
+
+class TestClaudeSessionTitle:
+    """The resume picker names a session the way Claude's terminal tab does."""
+
+    @staticmethod
+    def _write(path: Path, *records: dict) -> Path:
+        lines = [json.dumps({"cwd": "/repo"})]
+        lines += [json.dumps(record) for record in records]
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def test_a_rename_wins_over_the_generated_name(self, tmp_path: Path) -> None:
+        path = self._write(
+            tmp_path / "s.jsonl",
+            {"type": "ai-title", "aiTitle": "Generated", "sessionId": "s"},
+            {"type": "custom-title", "customTitle": "Mine", "sessionId": "s"},
+            {"type": "ai-title", "aiTitle": "Generated again", "sessionId": "s"},
+        )
+        assert read_claude_session_title(path) == "Mine"
+
+    def test_the_latest_record_counts(self, tmp_path: Path) -> None:
+        path = self._write(
+            tmp_path / "s.jsonl",
+            {"type": "ai-title", "aiTitle": "Old", "sessionId": "s"},
+            {"type": "ai-title", "aiTitle": "New", "sessionId": "s"},
+        )
+        assert read_claude_session_title(path) == "New"
+
+    def test_a_title_only_at_the_start_of_a_long_file_is_found(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "s.jsonl"
+        lines = [json.dumps({"type": "ai-title", "aiTitle": "Early"})]
+        lines += [
+            json.dumps({"type": "user", "message": {"content": "y" * 500}})
+        ] * 1200
+        path.write_text("\n".join(lines) + "\n")
+        assert path.stat().st_size > 256 * 1024
+        assert read_claude_session_title(path) == "Early"
+
+    def test_no_title_and_no_file_read_as_empty(self, tmp_path: Path) -> None:
+        assert read_claude_session_title(self._write(tmp_path / "s.jsonl")) == ""
+        assert read_claude_session_title(tmp_path / "missing.jsonl") == ""
+
+    def test_discovery_carries_the_name(self, tmp_path: Path) -> None:
+        projects = tmp_path / "projects"
+        project = projects / "repo"
+        project.mkdir(parents=True)
+        path = project / "sess-1.jsonl"
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"cwd": str(tmp_path / "repo")}),
+                    json.dumps(
+                        {"type": "user", "message": {"role": "user", "content": "hi"}}
+                    ),
+                    json.dumps({"type": "custom-title", "customTitle": "VPN guide"}),
+                ]
+            )
+            + "\n"
+        )
+
+        sessions = discover_claude_sessions(projects)
+
+        assert [(s.summary, s.title) for s in sessions] == [("hi", "VPN guide")]

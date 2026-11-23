@@ -51,6 +51,7 @@ class ResumableSession:
     provider_name: str
     mtime: float = 0.0
     msg_count: int | None = None
+    title: str = ""  # the session's name in the agent (``/rename``), if any
 
 
 @dataclass(frozen=True, slots=True)

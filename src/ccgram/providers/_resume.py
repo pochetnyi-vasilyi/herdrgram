@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from ccgram.providers.base import ResumableSession
 from ccgram.utils import read_session_metadata_from_jsonl
 
 _IndexParseError = (json.JSONDecodeError, OSError)
+
+# Claude Code re-appends its title records as a session goes on, so the end of
+# a transcript holds the current name; the start is read only as a fallback.
+_TITLE_SCAN_BYTES = 256 * 1024
 
 
 def index_message_count(entry: dict) -> int | None:
@@ -31,7 +36,7 @@ def discover_claude_sessions(
     if cwd and resolved_cwd is None:
         return []
 
-    candidates: list[tuple[float, ResumableSession]] = []
+    candidates: list[tuple[float, ResumableSession, Path]] = []
     seen_ids: set[str] = set()
     if not projects_path.exists():
         return []
@@ -50,8 +55,61 @@ def discover_claude_sessions(
         _scan_bare_jsonl(project_dir, resolved_cwd, seen_ids, candidates)
 
     candidates.sort(key=lambda item: item[0], reverse=True)
-    sessions = [session for _, session in candidates]
-    return sessions[:limit] if limit is not None else sessions
+    chosen = candidates[:limit] if limit is not None else candidates
+    return [
+        replace(session, title=read_claude_session_title(path))
+        for _, session, path in chosen
+    ]
+
+
+def read_claude_session_title(path: Path) -> str:
+    """The session's name as Claude Code shows it in the terminal title.
+
+    A name given with ``/rename`` (a ``custom-title`` record) wins over the one
+    Claude generated (``ai-title``); the latest record of each kind counts.
+    Empty when the transcript holds neither or cannot be read.
+    """
+    try:
+        with path.open("rb") as f:
+            size = f.seek(0, 2)
+            start = max(0, size - _TITLE_SCAN_BYTES)
+            f.seek(start)
+            tail = f.read()
+            if start == 0:
+                return _title_from(tail, partial_first_line=False)
+            title = _title_from(tail, partial_first_line=True)
+            if title:
+                return title
+            f.seek(0)
+            return _title_from(f.read(_TITLE_SCAN_BYTES), partial_first_line=False)
+    except OSError:
+        return ""
+
+
+def _title_from(data: bytes, *, partial_first_line: bool) -> str:
+    lines = data.split(b"\n")
+    if partial_first_line:
+        lines = lines[1:]
+    custom = generated = ""
+    for line in lines:
+        if b'"custom-title"' not in line and b'"ai-title"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("type")
+        if kind == "custom-title":
+            value = entry.get("customTitle")
+            if isinstance(value, str) and value.strip():
+                custom = value.strip()
+        elif kind == "ai-title":
+            value = entry.get("aiTitle")
+            if isinstance(value, str) and value.strip():
+                generated = value.strip()
+    return custom or generated
 
 
 def _resolve_path(path: str) -> str | None:
@@ -65,7 +123,7 @@ def _scan_index(
     index_file: Path,
     resolved_cwd: str | None,
     seen_ids: set[str],
-    candidates: list[tuple[float, ResumableSession]],
+    candidates: list[tuple[float, ResumableSession, Path]],
 ) -> None:
     try:
         index_data = json.loads(index_file.read_text(encoding="utf-8"))
@@ -90,7 +148,9 @@ def _scan_index(
         )
         if session is not None:
             seen_ids.add(session.session_id)
-            candidates.append((session.mtime, session))
+            candidates.append(
+                (session.mtime, session, Path(raw_entry.get("fullPath", "")))
+            )
 
 
 def _parse_index_entry(
@@ -141,7 +201,7 @@ def _scan_bare_jsonl(
     project_dir: Path,
     resolved_cwd: str | None,
     seen_ids: set[str],
-    candidates: list[tuple[float, ResumableSession]],
+    candidates: list[tuple[float, ResumableSession, Path]],
 ) -> None:
     try:
         jsonl_files = list(project_dir.glob("*.jsonl"))
@@ -176,5 +236,6 @@ def _scan_bare_jsonl(
                     provider_name="claude",
                     mtime=mtime,
                 ),
+                jsonl_file,
             )
         )
