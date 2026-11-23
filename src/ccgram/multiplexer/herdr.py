@@ -250,6 +250,7 @@ class HerdrLiveRecord:
     tab_id: str
     workspace_id: str
     cwd: str = ""
+    title: str = ""
 
 
 def _session_field(value: object) -> str | None:
@@ -357,6 +358,9 @@ def _parse_live_record(record: Mapping[str, object]) -> HerdrLiveRecord | None:
     # whatever the agent currently shells into (a worktree, a plugin cache) and
     # would send hookless transcript discovery to the wrong session directory.
     cwd = _session_field(record.get("cwd")) or ""
+    # The terminal title the agent set, without the spinner herdr strips off:
+    # Claude Code titles it with the session's name. Display only.
+    title = (_session_field(record.get("terminal_title_stripped")) or "").strip()
     return HerdrLiveRecord(
         target_id=target_id,
         composite=composite,
@@ -365,6 +369,7 @@ def _parse_live_record(record: Mapping[str, object]) -> HerdrLiveRecord | None:
         tab_id=locators["tab_id"] or "",
         workspace_id=locators["workspace_id"] or "",
         cwd=cwd,
+        title=title,
     )
 
 
@@ -781,6 +786,8 @@ class HerdrManager:
             native_session_id=native_session_id,
             native_agent=record.composite.agent if native_session_id else "",
             alias_window_ids=self._superseded_target_ids(record),
+            agent_title=record.title,
+            terminal_key=record.terminal_id,
         )
 
     def _note_provisional_target(self, record: HerdrLiveRecord) -> None:

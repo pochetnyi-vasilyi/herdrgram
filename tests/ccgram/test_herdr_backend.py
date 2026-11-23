@@ -2015,6 +2015,28 @@ async def test_live_records_publish_the_agents_native_session_id() -> None:
     assert windows[0].native_agent == "claude"
 
 
+async def test_live_records_publish_the_terminal_title_and_terminal() -> None:
+    """The session's name (its terminal title) and the hosting terminal travel up.
+
+    The name is display only. The terminal outlives a ``/resume`` inside it,
+    which re-keys the target, so a consumer can follow the pane across it.
+    """
+    record = _agent(
+        terminal_id="term-q",
+        terminal_title="✳ VPN guide",
+        terminal_title_stripped=" VPN guide ",
+    )
+    windows = await _manager(_live_fake(record)).list_windows()
+    assert len(windows) == 1
+    assert windows[0].agent_title == "VPN guide"
+    assert windows[0].terminal_key == "term-q"
+
+
+async def test_a_record_without_a_title_publishes_none() -> None:
+    windows = await _manager(_live_fake(_agent())).list_windows()
+    assert windows[0].agent_title == ""
+
+
 async def test_terminal_fallback_publishes_no_native_session_id() -> None:
     """A minted terminal identity is not a session the provider ever wrote.
 

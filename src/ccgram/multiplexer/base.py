@@ -94,6 +94,24 @@ class WindowRef:
     right transcript layout without a per-backend conditional.
     """
 
+    agent_title: str = ""
+    """The name the agent gives its session, as its terminal title shows it.
+
+    Claude Code titles its terminal with the session's name — the one set with
+    ``/rename``, or the one it generated — which is what a terminal tab shows.
+    Empty when the backend does not publish a pane's title (tmux and agterm
+    leave it empty). Display only, never an identity.
+    """
+
+    terminal_key: str = ""
+    """The backend's own identity of the terminal the agent runs in.
+
+    Unlike ``window_id`` it survives the agent switching sessions inside that
+    terminal (``/resume``, ``/clear``), so a consumer can follow one pane
+    across the switch. Empty when the backend has no such identity. Never an
+    address: actions still go through ``window_id``.
+    """
+
     def matches(self, window_id: str) -> bool:
         """Whether *window_id* names this window, under any identity it has had.
 
