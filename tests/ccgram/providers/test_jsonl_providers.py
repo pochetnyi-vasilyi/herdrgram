@@ -262,6 +262,115 @@ class TestCodexTranscriptParsing:
         assert messages[0].text == "finished"
         assert messages[0].phase == "final_answer"
 
+    @staticmethod
+    def _shown_record_by_record(entries: list[dict]) -> list[tuple[str, str]]:
+        """Parse one record per call, as the mobile server does."""
+        codex = CodexProvider()
+        pending: dict = {}
+        shown: list[tuple[str, str]] = []
+        for entry in entries:
+            messages, pending = codex.parse_transcript_entries([entry], pending)
+            shown += [(message.role, message.text) for message in messages]
+        return shown
+
+    @staticmethod
+    def _message(role: str, text: str, phase: str | None = None) -> dict:
+        block = "output_text" if role == "assistant" else "input_text"
+        payload = {
+            "type": "message",
+            "role": role,
+            "content": [{"type": block, "text": text}],
+        }
+        if phase:
+            payload["phase"] = phase
+        return {"type": "response_item", "payload": payload}
+
+    def test_task_complete_repeating_the_answer_in_a_later_call_is_dropped(
+        self,
+    ) -> None:
+        codex = CodexProvider()
+        final = self._message("assistant", "OK", "final_answer")
+        complete = {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "last_agent_message": "OK"},
+        }
+        first, pending = codex.parse_transcript_entries([final], {})
+        second, _ = codex.parse_transcript_entries(
+            [{"type": "event_msg", "payload": {"type": "token_count"}}, complete],
+            pending,
+        )
+        assert [message.text for message in first] == ["OK"]
+        assert second == []
+
+    def test_codex_turn_parsed_record_by_record_shows_prompt_and_one_answer(
+        self,
+    ) -> None:
+        agents_md = (
+            "# AGENTS.md instructions for /home/u/p\n\n<INSTRUCTIONS>\n- a rule\n"
+            "</INSTRUCTIONS><environment_context>\n  <cwd>/home/u/p</cwd>\n"
+            "</environment_context>"
+        )
+        shown = self._shown_record_by_record(
+            [
+                {"type": "event_msg", "payload": {"type": "task_started"}},
+                self._message("developer", "You are Codex"),
+                self._message("user", agents_md),
+                self._message("user", "Reply with OK"),
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {"type": "AgentMessage"},
+                    },
+                },
+                self._message("assistant", "OK", "final_answer"),
+                {"type": "event_msg", "payload": {"type": "token_count"}},
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "last_agent_message": "OK"},
+                },
+            ]
+        )
+        assert shown == [("user", "Reply with OK"), ("assistant", "OK")]
+
+    def test_next_turn_without_response_item_still_shows_task_complete(self) -> None:
+        complete = {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "last_agent_message": "OK"},
+        }
+        shown = self._shown_record_by_record(
+            [
+                self._message("user", "first"),
+                self._message("assistant", "OK", "final_answer"),
+                complete,
+                self._message("user", "again"),
+                complete,
+            ]
+        )
+        assert shown == [
+            ("user", "first"),
+            ("assistant", "OK"),
+            ("user", "again"),
+            ("assistant", "OK"),
+        ]
+
+    def test_injected_context_is_not_a_user_message(self) -> None:
+        codex = CodexProvider()
+        for text in (
+            "# AGENTS.md instructions for /x\n\n<INSTRUCTIONS>\n- rule\n</INSTRUCTIONS>",
+            "<environment_context>\n  <cwd>/x</cwd>\n</environment_context>",
+            "<permissions instructions>\nsandbox\n</permissions instructions>",
+            "<user_instructions>\nrule\n</user_instructions>",
+        ):
+            entry = self._message("user", text)
+            messages, _ = codex.parse_transcript_entries([entry], {})
+            assert messages == []
+            assert codex.parse_history_entry(entry) is None
+            assert codex.is_user_transcript_entry(entry) is False
+        typed = self._message("user", "how does AGENTS.md work?")
+        messages, _ = codex.parse_transcript_entries([typed], {})
+        assert [message.text for message in messages] == ["how does AGENTS.md work?"]
+
     def test_tracks_function_call_pending(self) -> None:
         codex = CodexProvider()
         entries = [
@@ -805,7 +914,8 @@ class TestCodexToolCallIntegration:
         ]
         assert messages[0].text == "Let me fix that."
         assert messages[5].text == "All done!"
-        assert pending == {}
+        assert "ct1" not in pending
+        assert "fc1" not in pending
 
     def test_function_call_output_without_pending_no_formatting(self) -> None:
         codex = CodexProvider()

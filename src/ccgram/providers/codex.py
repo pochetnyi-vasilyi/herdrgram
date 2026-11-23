@@ -418,6 +418,34 @@ def _parse_function_call_output(
     )
 
 
+# Codex writes the context it injects into a session as user-role messages:
+# the AGENTS.md text, the environment block, the sandbox permissions. None of
+# them is something the user typed.
+_INJECTED_CONTEXT_PREFIXES = (
+    "# AGENTS.md instructions",
+    "<environment_context",
+    "<permissions",
+    "<user_instructions",
+)
+
+# Key in the parser's carried state holding the text of the last complete
+# assistant message (response_item) of the current turn. Codex writes the
+# final answer as a response_item and again as
+# task_complete.last_agent_message; the two can arrive in separate parse calls
+# (the mobile server parses record by record), so adjacent-duplicate removal
+# within one call does not catch them.
+_TURN_LAST_ASSISTANT = "__codex_turn_last_assistant__"
+
+
+def _is_injected_context(text: str) -> bool:
+    return text.lstrip().startswith(_INJECTED_CONTEXT_PREFIXES)
+
+
+def _start_turn(pending: dict[str, Any]) -> dict[str, Any]:
+    pending.pop(_TURN_LAST_ASSISTANT, None)
+    return pending
+
+
 def _parse_response_message(
     payload: dict[str, Any],
     pending: dict[str, Any],
@@ -429,6 +457,12 @@ def _parse_response_message(
     text = _extract_text_blocks(payload.get("content", ""))
     if not text:
         return [], pending
+    if role == "user":
+        if _is_injected_context(text):
+            return [], pending
+        pending = _start_turn(pending)
+    else:
+        pending[_TURN_LAST_ASSISTANT] = text
     phase = payload.get("phase")
     return (
         [
@@ -449,10 +483,14 @@ def _parse_event_message(
 ) -> tuple[list[AgentMessage], dict[str, Any]]:
     """Parse Codex event_msg payloads that carry assistant-visible text."""
     payload_type = payload.get("type", "")
+    if payload_type in ("task_started", "user_message"):
+        return [], _start_turn(pending)
     if payload_type == "agent_message":
         text = payload.get("message", "")
         if not isinstance(text, str) or not text:
             return [], pending
+        # Not remembered: a streamed agent_message is incomplete, and the
+        # task_complete repeating its text is what marks it complete.
         return (
             [
                 AgentMessage(
@@ -466,7 +504,8 @@ def _parse_event_message(
         )
     if payload_type == "task_complete":
         text = payload.get("last_agent_message", "")
-        if not isinstance(text, str) or not text:
+        already_sent = pending.pop(_TURN_LAST_ASSISTANT, None) == text
+        if not isinstance(text, str) or not text or already_sent:
             return [], pending
         return (
             [
@@ -493,8 +532,9 @@ def _parse_input_item(
     if payload.get("role", "") != "user":
         return [], pending
     content = payload.get("content", "")
-    if not isinstance(content, str) or not content:
+    if not isinstance(content, str) or not content or _is_injected_context(content):
         return [], pending
+    pending = _start_turn(pending)
     return ([AgentMessage(text=content, role="user", content_type="text")], pending)
 
 
@@ -693,7 +733,7 @@ class CodexProvider(JsonlProvider):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "input_text":
                         text = block.get("text", "")
-                        if text.startswith(("<permissions", "<environment_context")):
+                        if isinstance(text, str) and _is_injected_context(text):
                             return False
             return True
         return entry_type == "input_item" and payload.get("role") == "user"
@@ -711,7 +751,7 @@ class CodexProvider(JsonlProvider):
                 return None
             content = payload.get("content", "")
             text = _extract_text_blocks(content)
-            if not text:
+            if not text or (role == "user" and _is_injected_context(text)):
                 return None
             return AgentMessage(
                 text=text,
@@ -721,7 +761,7 @@ class CodexProvider(JsonlProvider):
         if entry_type == "input_item" and payload.get("role") == "user":
             content = payload.get("content", "")
             text = content if isinstance(content, str) else ""
-            if not text:
+            if not text or _is_injected_context(text):
                 return None
             return AgentMessage(text=text, role="user", content_type="text")
 
